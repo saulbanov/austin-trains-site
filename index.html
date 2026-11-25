@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Austin trains</title>
+<meta name="theme-color" content="#1d3b2a">
+<style>
+  :root { --bg:#f6f4ee; --card:#fff; --ink:#1f2421; --muted:#5f6862; --line:#e2ded3;
+          --freight:#b5541c; --amtrak:#1f5fa8; --red:#c0272d; --bar:#e9b48f; --now:#b5541c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141715; --card:#1e2220; --ink:#ecebe6; --muted:#a4aba6; --line:#323833;
+            --freight:#f08a4b; --amtrak:#7fb0ef; --red:#f07479; --bar:#7a4a2c; --now:#f08a4b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px 14px 40px; }
+  h1 { font-size:22px; margin:4px 0 2px; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 10px; }
+  .sub { color:var(--muted); font-size:14px; margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin:0 0 14px; }
+  .best { font-size:28px; font-weight:700; line-height:1.15; }
+  .best small { display:block; font-size:15px; font-weight:400; color:var(--muted); margin-top:4px; }
+  ul.events { list-style:none; margin:0; padding:0; }
+  ul.events li { display:flex; gap:10px; padding:8px 0; border-top:1px solid var(--line); align-items:baseline; }
+  ul.events li:first-child { border-top:0; }
+  .t { font-variant-numeric:tabular-nums; font-weight:600; min-width:68px; }
+  .tag { font-size:12px; font-weight:700; padding:1px 7px; border-radius:99px; color:#fff; white-space:nowrap; }
+  .tag.amtrak { background:var(--amtrak); } .tag.red { background:var(--red); } .tag.freight { background:var(--freight); }
+  .what { flex:1; }
+  .what .note { display:block; color:var(--muted); font-size:13px; }
+  .chart { display:grid; grid-template-columns:repeat(16, 1fr); gap:3px; align-items:end; height:130px; margin-top:6px; }
+  .chart div { background:var(--bar); border-radius:3px 3px 0 0; position:relative; min-height:2px; }
+  .chart div.now { background:var(--now); }
+  .chart div.few { opacity:.45; }
+  .axis { display:grid; grid-template-columns:repeat(16, 1fr); gap:3px; font-size:11px; color:var(--muted); text-align:center; margin-top:4px; }
+  .legend { font-size:13px; color:var(--muted); margin-top:8px; }
+  .spot { padding:10px 0; border-top:1px solid var(--line); }
+  .spot:first-of-type { border-top:0; padding-top:0; }
+  .spot a { font-weight:600; color:inherit; }
+  .spot p { margin:4px 0 0; font-size:14px; color:var(--muted); }
+  .fine { font-size:13px; color:var(--muted); }
+  .fine p { margin:0 0 8px; }
+  .err { color:var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Austin trains</h1>
+  <p class="sub" id="now">Loading…</p>
+
+  <section class="card">
+    <h2 id="best-h">Best time for freight today</h2>
+    <div class="best" id="best">…</div>
+  </section>
+
+  <section class="card">
+    <h2>Next 2 hours</h2>
+    <ul class="events" id="events"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Chance of freight in a 30-minute wait</h2>
+    <div class="chart" id="chart"></div>
+    <div class="axis" id="axis"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="card">
+    <h2>Where to watch</h2>
+    <div id="spots"></div>
+  </section>
+
+  <section class="card fine" id="fine"></section>
+</main>
+
+<script>
+// Everything here runs on the phone. data.json holds the model's hourly rates
+// and the saved Red Line schedule; Amtrak times come live from Amtraker.
+const TZ = "America/Chicago";
+
+// Austin wall-clock time, whatever time zone the phone is in.
+function austinParts(d) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", {timeZone: TZ, hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"})
+    .formatToParts(d).map(x => [x.type, x.value]));
+  return {date: `${p.year}-${p.month}-${p.day}`, min: (+p.hour % 24) * 60 + +p.minute};
+}
+const clock = m => { m = ((m % 1440) + 1440) % 1440; const h = Math.floor(m / 60), mm = m % 60;
+  return `${h % 12 || 12}:${String(mm).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`; };
+const pct = p => `${Math.round(p * 100)}%`;
+const addDays = (iso, n) => { const d = new Date(iso + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10); };
+
+// Expected freight trains from minute `start` for `len` minutes, hour by hour.
+function expected(rates, start, len) {
+  let total = 0, t = start, left = len;
+  while (left > 0) { const step = Math.min(left, 60 - (t % 60));
+    total += rates[Math.floor(t / 60) % 24] * step / 60; t += step; left -= step; }
+  return total;
+}
+const chance = (rates, start, len) => 1 - Math.exp(-expected(rates, start, len));
+
+// How many railfan sightings back an hour's shape.
+function sure(n) {
+  if (n >= 50) return `${n} sightings at this hour`;
+  if (n >= 10) return `${n} sightings at this hour, a rough shape`;
+  return `few sightings at this hour, so an even share of the day's trains`;
+}
+
+async function liveAmtrak(data, today) {
+  // Returns [{date, min, label}] for Texas Eagle stops at Austin, live where possible.
+  const out = [], covered = new Set();
+  for (const tt of data.amtrak.timetable) {
+    try {
+      const r = await fetch(`https://api-v3.amtraker.com/v3/trains/${tt.train}`);
+      const runs = (await r.json())[tt.train] || [];
+      for (const run of runs) for (const s of run.stations) {
+        if (s.code !== "AUS" || !s.schArr) continue;
+        const sch = austinParts(new Date(s.schArr)), when = austinParts(new Date(s.arr || s.schArr));
+        covered.add(`${tt.train}|${sch.date}`);
+        const late = Math.round((new Date(s.arr || s.schArr) - new Date(s.schArr)) / 60000);
+        const status = Math.abs(late) < 5 ? "on time" : late > 0 ? `${late} min late` : `${-late} min early`;
+        out.push({date: when.date, min: when.min, kind: "amtrak",
+          label: `Texas Eagle ${tt.train}, ${tt.direction}`, note: `Live: ${status}. Stops about 10 minutes at W 3rd & Lamar.`});
+      }
+    } catch (e) { /* no network or site down: the timetable below fills in */ }
+  }
+  for (const day of [today, addDays(today, 1)]) for (const tt of data.amtrak.timetable) {
+    if (covered.has(`${tt.train}|${day}`)) continue;
+    const [h, m] = tt.time.split(":").map(Number);
+    out.push({date: day, min: h * 60 + m, kind: "amtrak", label: `Texas Eagle ${tt.train}, ${tt.direction}`,
+      note: "Timetable time; it can run late."});
+  }
+  return out;
+}
+
+async function main() {
+  const data = await (await fetch("data.json", {cache: "no-store"})).json();
+  const rates = data.freight.trains_per_hour, seen = data.freight.sightings;
+  const now = austinParts(new Date()), today = now.date;
+  document.getElementById("now").textContent =
+    `${new Date(today + "T12:00:00Z").toLocaleDateString("en-US", {weekday: "long", month: "long", day: "numeric", timeZone: "UTC"})}, ${clock(now.min)}`;
+
+  // Best half hour left today (6 AM to 10 PM), or tomorrow's if today is done.
+  let from = Math.max(now.min - (now.min % 30), 360), label = "Best time for freight today";
+  if (from > 21 * 60 + 30) { from = 360; label = "Best time for freight tomorrow"; }
+  let best = null;
+  for (let t = from; t <= 21 * 60 + 30; t += 30) {
+    const p = chance(rates, t, 30);
+    if (!best || p > best.p + 1e-9) best = {t, p};
+  }
+  document.getElementById("best-h").textContent = label;
+  document.getElementById("best").innerHTML =
+    `${clock(best.t)} to ${clock(best.t + 30)}, about ${pct(best.p)}<small>Chance of at least one freight train in that half hour at any of the spots below; they share one line. Based on ${sure(seen[Math.floor(best.t / 60)])}.</small>`;
+
+  // Next 2 hours: Amtrak, Red Line, and a freight chance for each half hour.
+  const end = now.min + 120, events = [];
+  const inWindow = e => { const m = e.date === today ? e.min : e.date === addDays(today, 1) ? e.min + 1440 : -1;
+    return m >= now.min && m <= end ? m : null; };
+  for (const day of [today, addDays(today, 1)]) for (const [hhmm, where] of (data.red_line.by_date[day] || [])) {
+    const [h, m] = hhmm.split(":").map(Number);
+    events.push({date: day, min: h * 60 + m, kind: "red", label: where[0].toUpperCase() + where.slice(1), note: `Scheduled, ${data.red_line.station}.`});
+  }
+  const ul = document.getElementById("events");
+  const freightRow = t => ({at: t, kind: "freight", label: `${pct(chance(rates, t % 1440, 30))} chance of one by ${clock(t + 30)}`,
+    note: sure(seen[Math.floor((t % 1440) / 60)])});
+  const render = list => { ul.innerHTML = list.sort((a, b) => a.at - b.at).map(e =>
+    `<li><span class="t">${clock(e.at)}</span><span class="what"><span class="tag ${e.kind}">${
+      e.kind === "red" ? "Red Line" : e.kind === "amtrak" ? "Amtrak" : "Freight"}</span> ${e.label}<span class="note">${e.note}</span></span></li>`).join(""); };
+  const rows = [];
+  for (let t = now.min; t < end; t += 30) rows.push(freightRow(t));
+  const add = list => { for (const e of list) { const at = inWindow(e); if (at !== null) rows.push({...e, at}); } };
+  add(events); render(rows.slice());
+  try { add(await liveAmtrak(data, today)); render(rows.slice()); }
+  catch (e) { ul.insertAdjacentHTML("beforeend", `<li class="err">Amtrak check failed.</li>`); }
+
+  // Hour chart, 6 AM to 9 PM.
+  const hours = [...Array(16)].map((_, i) => i + 6), ps = hours.map(h => chance(rates, h * 60, 30));
+  const top = Math.max(...ps);
+  document.getElementById("chart").innerHTML = hours.map((h, i) =>
+    `<div class="${h === Math.floor(now.min / 60) ? "now" : ""} ${seen[h] < 10 ? "few" : ""}" style="height:${ps[i] / top * 100}%" title="${clock(h * 60)}: ${pct(ps[i])}, ${seen[h]} sightings"></div>`).join("");
+  document.getElementById("axis").innerHTML = hours.map(h => `<span>${h % 3 === 0 ? (h % 12 || 12) + (h < 12 ? "a" : "p") : ""}</span>`).join("");
+  document.getElementById("legend").textContent =
+    `Range ${pct(Math.min(...ps))} to ${pct(top)}. Pale bars are hours with fewer than 10 railfan sightings. The dark bar is now.`;
+
+  document.getElementById("spots").innerHTML = data.spots.map(s =>
+    `<div class="spot"><a href="${s.map}">${s.name}</a><p>${s.notes}</p></div>`).join("");
+
+  const f = data.freight;
+  document.getElementById("fine").innerHTML = `
+    <p>Freight runs on no public schedule. The chances come from federal counts of trains on this line, about ${Math.round(rates.reduce((a, b) => a + b, 0))} freight trains a day, spread across the day by the times railfans have filmed trains here.</p>
+    <p>${f.adjusted_by_trips ? `Adjusted to match ${f.trips_logged} logged trips.` : `${f.trips_logged} of ${f.trips_needed} trips logged; the chances start adjusting to what we actually see after ${f.trips_needed}.`}</p>
+    <p>Red Line times are CapMetro's schedule through ${data.red_line.schedule_ends}. Updated ${data.made.slice(0, 10)}.</p>`;
+}
+main().catch(e => { document.getElementById("now").innerHTML = `<span class="err">Couldn't load the forecast: ${e.message}</span>`; });
+</script>
+</body>
+</html>
